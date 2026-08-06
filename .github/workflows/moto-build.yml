@@ -32,14 +32,15 @@ jobs:
   build-motorola-kernel:
     name: "G57 Power (mumba) 6.6.87 ReSukiSU"
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
 
     steps:
       # ==================== 构建信息摘要 ====================
       - name: 构建信息摘要
         run: |
           echo "========================================"
-          echo "  摩托罗拉 G57 Power 官方源码内核构建"
+          echo "  摩托罗拉 G57 Power 官方源码内核构建 v2"
+          echo "  (不依赖 Google 服务器, 纯 GitHub 源)"
           echo "========================================"
           echo "设备        : Moto G57 Power (mumba)"
           echo "固件 tag    : MMI-W1WAAS36.48-12-23-3"
@@ -74,26 +75,15 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
+          sudo apt-get install -y \
+            build-essential bc bison flex python3 \
+            libssl-dev libelf-dev dwarves \
+            clang lld llvm ccache zip
 
-      # ==================== 初始化构建环境 ====================
-      - name: 初始化构建环境
-        run: |
-          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
-          mkdir -p "$KERNEL_ROOT"
-
-          cat >> $GITHUB_ENV << EOF
-          KERNEL_ROOT=$KERNEL_ROOT
-          DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig
-          SUSFS4KSU=$GITHUB_WORKSPACE/susfs4ksu
-          ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
-          EOF
-
-          mkdir -p "$GITHUB_WORKSPACE/git-repo"
-          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
-          chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
-          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
-          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
+          echo "Clang 版本:"
+          clang --version | head -3
+          echo "LLD 版本:"
+          ld.lld --version | head -1
 
       # ==================== 配置 Git ====================
       - name: 配置 Git
@@ -101,63 +91,31 @@ jobs:
           git config --global user.name "BuildBot"
           git config --global user.email "BuildMotoKernel@gmail.com"
 
-      # ==================== 同步 AOSP 构建环境 ====================
-      - name: 同步 AOSP 内核构建环境 (android15-6.6)
-        working-directory: ${{ env.KERNEL_ROOT }}
+      # ==================== 克隆摩托罗拉官方内核源码 ====================
+      - name: 克隆摩托罗拉官方内核源码
         run: |
-          BRANCH="common-android15-6.6-2025-05"
-
-          # 检查分支是否被标记为 deprecated
-          REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${BRANCH} 2>&1 || true)
-          echo "远程分支信息: $REMOTE_BRANCH"
-
-          if grep -q deprecated <<< "$REMOTE_BRANCH"; then
-            echo "检测到已弃用的分支: $BRANCH"
-            $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "$BRANCH" --repo-rev=v2.16
-            sed -i "s|\"$BRANCH\"|\"deprecated/$BRANCH\"|g" .repo/manifests/default.xml
-          else
-            $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "$BRANCH" --repo-rev=v2.16
-          fi
-
-          # 首次尝试 sync
-          $REPO sync -c -j$(nproc --all) --no-tags --fail-fast || {
-            echo "首次 sync 失败，等待 10 秒后重试..."
+          for i in 1 2 3; do
+            git clone --depth=1 -b MMI-W1WAAS36.48-12-23-3 \
+              https://github.com/MotorolaMobilityLLC/kernel-msm.git kernel_src && break
+            echo "第 $i 次克隆失败，10 秒后重试..."
+            rm -rf kernel_src
             sleep 10
-            $REPO sync -c -j$(nproc --all) --no-tags --fail-fast || {
-              echo "第二次 sync 失败，再试一次（降低并发）..."
-              sleep 10
-              $REPO sync -c -j4 --no-tags --fail-fast
-            }
-          }
+          done
 
-          echo "AOSP 环境内容:"
-          ls
-
-      # ==================== 替换为摩托罗拉官方内核源码 ====================
-      - name: 替换为摩托罗拉官方内核源码
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          echo "移除 AOSP common 内核源码..."
-          rm -rf common
-
-          echo "克隆摩托罗拉官方内核源码 (MMI-W1WAAS36.48-12-23-3)..."
-          git clone --depth=1 -b MMI-W1WAAS36.48-12-23-3 \
-            https://github.com/MotorolaMobilityLLC/kernel-msm.git common
+          if [ ! -d "kernel_src" ]; then
+            echo "::error::克隆摩托罗拉内核源码失败"
+            exit 1
+          fi
 
           echo "内核源码版本确认:"
-          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' common/Makefile
-
-          SUBLEVEL=$(grep '^SUBLEVEL = ' common/Makefile | awk '{print $3}')
-          if [ "$SUBLEVEL" != "87" ]; then
-            echo "::warning::SUBLEVEL=$SUBLEVEL 与预期 87 不符，请检查"
-          fi
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel_src/Makefile
 
           echo "设备配置确认 (mumba):"
-          cat common/arch/arm64/configs/vendor/ext_config/moto-parrot-mumba.config
+          cat kernel_src/arch/arm64/configs/vendor/ext_config/moto-parrot-mumba.config
 
       # ==================== 添加 ReSukiSU ====================
       - name: 添加 ReSukiSU (build-in 模式)
-        working-directory: ${{ env.KERNEL_ROOT }}
+        working-directory: kernel_src
         run: |
           BRANCH="${{ inputs.kernelsu_branch }}"
           if [ -z "$BRANCH" ]; then
@@ -174,20 +132,23 @@ jobs:
       - name: 克隆 SUSFS
         if: inputs.use_susfs
         run: |
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6
+          for i in 1 2 3; do
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 && break
+            echo "第 $i 次克隆失败，10 秒后重试..."
+            rm -rf susfs4ksu
+            sleep 10
+          done
           SUSFS_COMMIT_DATE=$(git -C susfs4ksu log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
           echo "SUSFS 最新提交日期: $SUSFS_COMMIT_DATE"
 
       # ==================== 应用 SUSFS 补丁 ====================
       - name: 应用 SUSFS 补丁
         if: inputs.use_susfs
-        working-directory: ${{ env.KERNEL_ROOT }}
+        working-directory: kernel_src
         run: |
-          cp $SUSFS4KSU/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common/
-          cp $SUSFS4KSU/kernel_patches/fs/* ./common/fs/
-          cp $SUSFS4KSU/kernel_patches/include/linux/* ./common/include/linux/
-
-          cd common
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/* ./fs/
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/* ./include/linux/
 
           # 6.6.50~92: base.c 头部上下文调整（87 属于此范围）
           if ! grep -qF '#include <linux/dma-buf.h>' fs/proc/base.c; then
@@ -221,7 +182,7 @@ jobs:
       # ==================== CVE 安全补丁 ====================
       - name: 应用 CVE-2026-43499 安全补丁
         if: inputs.cve_2026_43499_patch
-        working-directory: ${{ env.KERNEL_ROOT }}/common
+        working-directory: kernel_src
         run: |
           if [ -f "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" ]; then
             bash "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" "6.6" "87" "$GITHUB_WORKSPACE/security_patch" || echo "::warning::CVE 补丁应用出现问题，继续构建"
@@ -231,10 +192,9 @@ jobs:
 
       # ==================== 配置内核版本字符串 ====================
       - name: 配置内核版本字符串（对齐 uname）
-        working-directory: ${{ env.KERNEL_ROOT }}/common
+        working-directory: kernel_src
         run: |
           FULL_UNAME="${{ inputs.device_uname }}"
-          # 去掉开头的 6.6.XX，剩下的就是 localversion 后缀
           SUFFIX=$(echo "$FULL_UNAME" | sed -E 's/^6\.6\.[0-9]+//')
 
           if [ -z "$SUFFIX" ]; then
@@ -252,19 +212,24 @@ jobs:
 
           tail -3 ./scripts/setlocalversion
 
-      # ==================== 写入 KSU/SUSFS 配置 fragment ====================
-      - name: 写入 KSU/SUSFS 配置
-        run: |
-          FRAG="$KERNEL_ROOT/common/arch/arm64/configs/ksu.fragment"
+          # 对齐原厂编译时间戳（/proc/version 显示用）
+          echo "KBUILD_BUILD_TIMESTAMP=Thu Oct 23 14:31:17 UTC 2025" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
 
-          cat > "$FRAG" << 'EOF'
+      # ==================== 写入 KSU/SUSFS 配置 ====================
+      - name: 写入 KSU/SUSFS 配置
+        working-directory: kernel_src
+        run: |
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU=y
           CONFIG_TMPFS_XATTR=y
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
           if [ "${{ inputs.use_susfs }}" = "true" ]; then
-            cat >> "$FRAG" << 'EOF'
+            cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -279,71 +244,56 @@ jobs:
           fi
 
           # 去掉行首缩进
-          sed -i 's/^[[:space:]]*//' "$FRAG"
+          sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
 
-          echo "=== fragment 内容 ==="
-          cat "$FRAG"
-
-          # 取消 defconfig 检查
-          sed -i 's/check_defconfig//' "$KERNEL_ROOT/common/build.config.gki" || true
-
-      # ==================== 调整 bazel 构建配置 ====================
-      - name: 调整构建配置
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          # 移除 ABI 保护导出，允许新增 KSU 符号
-          sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' ./common/BUILD.bazel || true
-          sed -i '/kmi_symbol_list_strict_mode/d' ./common/BUILD.bazel || true
-          rm -rf ./common/android/abi_gki_protected_exports_* || true
-
-          # 调整 gki.aarch64 构建配置
-          sed -i 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' ./common/build.config.gki.aarch64 || true
-          sed -i '/MODULES_ORDER=android\/gki_aarch64_modules/d' ./common/build.config.gki.aarch64 || true
-          sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' ./common/build.config.gki.aarch64 || true
+          echo "=== 已追加的配置 ==="
+          tail -20 "$DEFCONFIG"
 
       # ==================== 编译内核 ====================
-      - name: 编译内核（bazel）
-        uses: nick-fields/retry@v4
-        with:
-          timeout_minutes: 45
-          max_attempts: 2
-          retry_on: timeout
-          command: |
-            set -ex
-            cd "$KERNEL_ROOT"
-            tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin \
-              --defconfig_fragment=//common:arch/arm64/configs/ksu.fragment \
-              //common:kernel_aarch64_dist
-
-      # ==================== 准备内核 Image ====================
-      - name: 准备内核 Image
-        working-directory: ${{ env.KERNEL_ROOT }}
+      - name: 编译内核
+        working-directory: kernel_src
         run: |
-          if [ -f "bazel-bin/common/kernel_aarch64/Image" ]; then
-            SRC="bazel-bin/common/kernel_aarch64/Image"
+          set -ex
+
+          # 生成配置
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+
+          # 确认 KSU 配置生效
+          grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=" .config || true
+
+          # 编译内核镜像
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tail -80
+
+          echo "=== 编译产物 ==="
+          ls -la arch/arm64/boot/
+
+      # ==================== 验证内核 ====================
+      - name: 验证内核版本字符串
+        working-directory: kernel_src
+        run: |
+          EXPECTED="${{ inputs.device_uname }}"
+          ACTUAL=$(strings arch/arm64/boot/Image | grep -m1 'Linux version' || true)
+          echo "Image 内版本信息: $ACTUAL"
+
+          if echo "$ACTUAL" | grep -qF "$EXPECTED"; then
+            echo "✅ 内核版本字符串与原厂一致: $EXPECTED"
           else
-            SRC=$(find bazel-bin -name Image -type f | head -1)
+            echo "::warning::内核版本字符串与预期不完全一致，请检查（不影响基本功能，但可能影响模块兼容）"
           fi
-
-          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
-            echo "::error::未找到编译产物 Image"
-            exit 1
-          fi
-
-          echo "内核镜像: $SRC"
-          strings "$SRC" | grep 'Linux version' || true
-          cp "$SRC" "$GITHUB_WORKSPACE/Image"
 
       # ==================== 创建 AnyKernel3 刷机包 ====================
       - name: 创建 AnyKernel3 刷机包
         run: |
-          git clone --depth=1 https://github.com/ReSukiSU-GKI/AnyKernel3.git
+          for i in 1 2 3; do
+            git clone --depth=1 https://github.com/ReSukiSU-GKI/AnyKernel3.git && break
+            sleep 10
+          done
+
+          cp kernel_src/arch/arm64/boot/Image AnyKernel3/Image
 
           cd AnyKernel3
-          mv "$GITHUB_WORKSPACE/Image" ./Image
-
           ZIP_NAME="ReSukiSU-mumba-G57Power-6.6.87-AnyKernel3.zip"
-          zip -r "../$ZIP_NAME" ./*
+          zip -r9 "../$ZIP_NAME" ./*
 
           echo "打包完成:"
           ls -la "../$ZIP_NAME"
@@ -355,21 +305,17 @@ jobs:
           REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
           mkdir -p "$REJECTS_DIR"
 
-          mapfile -t REJS < <(find "$KERNEL_ROOT" -type f -name '*.rej' 2>/dev/null)
+          mapfile -t REJS < <(find "$GITHUB_WORKSPACE/kernel_src" -type f -name '*.rej' 2>/dev/null)
           REJ_COUNT=${#REJS[@]}
           echo "发现 $REJ_COUNT 个 .rej 文件"
           echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
 
           if [ "$REJ_COUNT" -gt 0 ]; then
             for REJ in "${REJS[@]}"; do
-              REL="${REJ#"$KERNEL_ROOT"/}"
+              REL="${REJ#"$GITHUB_WORKSPACE/kernel_src"/}"
               DEST="$REJECTS_DIR/$REL"
               mkdir -p "$(dirname "$DEST")"
               cp "$REJ" "$DEST"
-              ORIG="${REJ%.rej}"
-              if [ -f "$ORIG" ]; then
-                cp "$ORIG" "${DEST%.rej}"
-              fi
               echo "$REL" >> "$REJECTS_DIR/index.txt"
             done
           fi
