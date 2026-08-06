@@ -1,0 +1,379 @@
+name: 摩托罗拉 G57 Power 官方源码内核构建
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_uname:
+        description: "手机 uname -r 的完整输出（重要！用于对齐模块兼容性）"
+        required: true
+        type: string
+        default: "6.6.87-android15-8-gf7bcb1c8e88f-ab14322536-4k"
+      kernelsu_branch:
+        description: "ReSukiSU 分支（留空=main）"
+        required: false
+        type: string
+        default: ""
+      use_susfs:
+        description: "启用 SUSFS（Root 隐藏）"
+        required: true
+        type: boolean
+        default: true
+      cve_2026_43499_patch:
+        description: "应用 CVE-2026-43499 安全补丁"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build-motorola-kernel:
+    name: "G57 Power (mumba) 6.6.87 ReSukiSU"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # ==================== 构建信息摘要 ====================
+      - name: 构建信息摘要
+        run: |
+          echo "========================================"
+          echo "  摩托罗拉 G57 Power 官方源码内核构建"
+          echo "========================================"
+          echo "设备        : Moto G57 Power (mumba)"
+          echo "固件 tag    : MMI-W1WAAS36.48-12-23-3"
+          echo "内核        : 6.6.87 (android15-6.6)"
+          echo "芯片        : 骁龙 6s Gen 4 (parrot)"
+          echo "KSU         : ReSukiSU (build-in)"
+          echo "SUSFS       : ${{ inputs.use_susfs }}"
+          echo "uname 输入  : ${{ inputs.device_uname }}"
+          echo "========================================"
+
+      # ==================== 清理磁盘空间 ====================
+      - name: 清理磁盘空间
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      # ==================== 检出仓库代码 ====================
+      - name: 检出代码仓库
+        uses: actions/checkout@v4
+
+      # ==================== 安装编译依赖 ====================
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
+
+      # ==================== 初始化构建环境 ====================
+      - name: 初始化构建环境
+        run: |
+          KERNEL_ROOT="$GITHUB_WORKSPACE/kernel"
+          mkdir -p "$KERNEL_ROOT"
+
+          cat >> $GITHUB_ENV << EOF
+          KERNEL_ROOT=$KERNEL_ROOT
+          DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig
+          SUSFS4KSU=$GITHUB_WORKSPACE/susfs4ksu
+          ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
+          EOF
+
+          mkdir -p "$GITHUB_WORKSPACE/git-repo"
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
+          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
+
+      # ==================== 配置 Git ====================
+      - name: 配置 Git
+        run: |
+          git config --global user.name "BuildBot"
+          git config --global user.email "BuildMotoKernel@gmail.com"
+
+      # ==================== 同步 AOSP 构建环境 ====================
+      - name: 同步 AOSP 内核构建环境 (android15-6.6)
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6-2025-05 --repo-rev=v2.16
+          $REPO sync -c -j$(nproc --all) --no-tags --fail-fast
+          echo "AOSP 环境内容:"
+          ls
+
+      # ==================== 替换为摩托罗拉官方内核源码 ====================
+      - name: 替换为摩托罗拉官方内核源码
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          echo "移除 AOSP common 内核源码..."
+          rm -rf common
+
+          echo "克隆摩托罗拉官方内核源码 (MMI-W1WAAS36.48-12-23-3)..."
+          git clone --depth=1 -b MMI-W1WAAS36.48-12-23-3 \
+            https://github.com/MotorolaMobilityLLC/kernel-msm.git common
+
+          echo "内核源码版本确认:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' common/Makefile
+
+          SUBLEVEL=$(grep '^SUBLEVEL = ' common/Makefile | awk '{print $3}')
+          if [ "$SUBLEVEL" != "87" ]; then
+            echo "::warning::SUBLEVEL=$SUBLEVEL 与预期 87 不符，请检查"
+          fi
+
+          echo "设备配置确认 (mumba):"
+          cat common/arch/arm64/configs/vendor/ext_config/moto-parrot-mumba.config
+
+      # ==================== 添加 ReSukiSU ====================
+      - name: 添加 ReSukiSU (build-in 模式)
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          BRANCH="${{ inputs.kernelsu_branch }}"
+          if [ -z "$BRANCH" ]; then
+            BRANCH="main"
+          fi
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "$BRANCH"
+
+          if [ -d "KernelSU/.git" ]; then
+            KSU_COMMIT_DATE=$(git -C KernelSU log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
+            echo "ReSukiSU 最新提交日期: $KSU_COMMIT_DATE"
+          fi
+
+      # ==================== 克隆 SUSFS ====================
+      - name: 克隆 SUSFS
+        if: inputs.use_susfs
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6
+          SUSFS_COMMIT_DATE=$(git -C susfs4ksu log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
+          echo "SUSFS 最新提交日期: $SUSFS_COMMIT_DATE"
+
+      # ==================== 应用 SUSFS 补丁 ====================
+      - name: 应用 SUSFS 补丁
+        if: inputs.use_susfs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          cp $SUSFS4KSU/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./common/
+          cp $SUSFS4KSU/kernel_patches/fs/* ./common/fs/
+          cp $SUSFS4KSU/kernel_patches/include/linux/* ./common/include/linux/
+
+          cd common
+
+          # 6.6.50~92: base.c 头部上下文调整（87 属于此范围）
+          if ! grep -qF '#include <linux/dma-buf.h>' fs/proc/base.c; then
+            sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux\/dma-buf.h>' fs/proc/base.c
+          fi
+
+          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch || true
+
+          # 6.6.50~97 已知问题修复: base.c 缺少 susfs_def.h
+          if grep -q 'AS_FLAGS_SUS_MAP\|susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF 'susfs_def.h' ./fs/proc/base.c; then
+            sed -i '/#include <linux\/dma-buf.h>/a #endif' ./fs/proc/base.c
+            sed -i '/#include <linux\/dma-buf.h>/a #include <linux\/susfs_def.h>' ./fs/proc/base.c
+            sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)' ./fs/proc/base.c
+            echo "已修复 base.c 缺少 susfs_def.h 问题"
+          fi
+
+          # 6.6 已知问题修复: memory.c 缺少 susfs_def.h
+          if grep -q 'SUSFS_IS_INODE_SUS_MAP' ./mm/memory.c && ! grep -qF '#include <linux/susfs_def.h>' ./mm/memory.c; then
+            if grep -qF '#include <linux/zswap.h>' ./mm/memory.c; then
+              sed -i '/#include <linux\/zswap.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif' ./mm/memory.c
+            else
+              sed -i '/#include <linux\/sched\/sysctl.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif' ./mm/memory.c
+            fi
+            echo "已修复 memory.c 缺少 susfs_def.h 问题"
+          fi
+
+          REJ_COUNT=$(find . -name "*.rej" | wc -l)
+          echo "SUSFS 补丁冲突文件数: $REJ_COUNT（0 为完美，>0 需要检查）"
+          find . -name "*.rej" | head -10
+
+      # ==================== CVE 安全补丁 ====================
+      - name: 应用 CVE-2026-43499 安全补丁
+        if: inputs.cve_2026_43499_patch
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" ]; then
+            bash "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" "6.6" "87" "$GITHUB_WORKSPACE/security_patch" || echo "::warning::CVE 补丁应用出现问题，继续构建"
+          else
+            echo "::warning::未找到 CVE 补丁脚本，跳过"
+          fi
+
+      # ==================== 配置内核版本字符串 ====================
+      - name: 配置内核版本字符串（对齐 uname）
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          FULL_UNAME="${{ inputs.device_uname }}"
+          # 去掉开头的 6.6.XX，剩下的就是 localversion 后缀
+          SUFFIX=$(echo "$FULL_UNAME" | sed -E 's/^6\.6\.[0-9]+//')
+
+          if [ -z "$SUFFIX" ]; then
+            echo "::error::无法从输入中解析出 localversion 后缀，请确认填写的是完整 uname -r 输出"
+            exit 1
+          fi
+
+          echo "目标内核版本字符串: 6.6.87$SUFFIX"
+
+          # 去掉 -dirty
+          sed -i 's/-dirty//' ./scripts/setlocalversion || true
+
+          # 6.6 新格式 setlocalversion：硬编码输出
+          perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"$SUFFIX"'"/s' ./scripts/setlocalversion || true
+
+          tail -3 ./scripts/setlocalversion
+
+      # ==================== 写入 KSU/SUSFS 配置 fragment ====================
+      - name: 写入 KSU/SUSFS 配置
+        run: |
+          FRAG="$KERNEL_ROOT/common/arch/arm64/configs/ksu.fragment"
+
+          cat > "$FRAG" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOF
+
+          if [ "${{ inputs.use_susfs }}" = "true" ]; then
+            cat >> "$FRAG" << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+
+          # 去掉行首缩进
+          sed -i 's/^[[:space:]]*//' "$FRAG"
+
+          echo "=== fragment 内容 ==="
+          cat "$FRAG"
+
+          # 取消 defconfig 检查
+          sed -i 's/check_defconfig//' "$KERNEL_ROOT/common/build.config.gki" || true
+
+      # ==================== 调整 bazel 构建配置 ====================
+      - name: 调整构建配置
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          # 移除 ABI 保护导出，允许新增 KSU 符号
+          sed -i '/^[[:space:]]*"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",$/d' ./common/BUILD.bazel || true
+          sed -i '/kmi_symbol_list_strict_mode/d' ./common/BUILD.bazel || true
+          rm -rf ./common/android/abi_gki_protected_exports_* || true
+
+          # 调整 gki.aarch64 构建配置
+          sed -i 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' ./common/build.config.gki.aarch64 || true
+          sed -i '/MODULES_ORDER=android\/gki_aarch64_modules/d' ./common/build.config.gki.aarch64 || true
+          sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' ./common/build.config.gki.aarch64 || true
+
+      # ==================== 编译内核 ====================
+      - name: 编译内核（bazel）
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 45
+          max_attempts: 2
+          retry_on: timeout
+          command: |
+            set -ex
+            cd "$KERNEL_ROOT"
+            tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin \
+              --defconfig_fragment=//common:arch/arm64/configs/ksu.fragment \
+              //common:kernel_aarch64_dist
+
+      # ==================== 准备内核 Image ====================
+      - name: 准备内核 Image
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          if [ -f "bazel-bin/common/kernel_aarch64/Image" ]; then
+            SRC="bazel-bin/common/kernel_aarch64/Image"
+          else
+            SRC=$(find bazel-bin -name Image -type f | head -1)
+          fi
+
+          if [ -z "$SRC" ] || [ ! -f "$SRC" ]; then
+            echo "::error::未找到编译产物 Image"
+            exit 1
+          fi
+
+          echo "内核镜像: $SRC"
+          strings "$SRC" | grep 'Linux version' || true
+          cp "$SRC" "$GITHUB_WORKSPACE/Image"
+
+      # ==================== 创建 AnyKernel3 刷机包 ====================
+      - name: 创建 AnyKernel3 刷机包
+        run: |
+          git clone --depth=1 https://github.com/ReSukiSU-GKI/AnyKernel3.git
+
+          cd AnyKernel3
+          mv "$GITHUB_WORKSPACE/Image" ./Image
+
+          ZIP_NAME="ReSukiSU-mumba-G57Power-6.6.87-AnyKernel3.zip"
+          zip -r "../$ZIP_NAME" ./*
+
+          echo "打包完成:"
+          ls -la "../$ZIP_NAME"
+
+      # ==================== 收集补丁冲突文件 ====================
+      - name: 收集补丁冲突文件
+        if: always()
+        run: |
+          REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
+          mkdir -p "$REJECTS_DIR"
+
+          mapfile -t REJS < <(find "$KERNEL_ROOT" -type f -name '*.rej' 2>/dev/null)
+          REJ_COUNT=${#REJS[@]}
+          echo "发现 $REJ_COUNT 个 .rej 文件"
+          echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
+
+          if [ "$REJ_COUNT" -gt 0 ]; then
+            for REJ in "${REJS[@]}"; do
+              REL="${REJ#"$KERNEL_ROOT"/}"
+              DEST="$REJECTS_DIR/$REL"
+              mkdir -p "$(dirname "$DEST")"
+              cp "$REJ" "$DEST"
+              ORIG="${REJ%.rej}"
+              if [ -f "$ORIG" ]; then
+                cp "$ORIG" "${DEST%.rej}"
+              fi
+              echo "$REL" >> "$REJECTS_DIR/index.txt"
+            done
+          fi
+
+      # ==================== 上传构建产物 ====================
+      - name: 上传 AnyKernel3 刷机包
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-mumba-G57Power-6.6.87
+          path: '*AnyKernel3.zip'
+          compression-level: 0
+          retention-days: 30
+
+      - name: 上传补丁冲突文件
+        if: always() && env.REJ_COUNT > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: moto-build-patch-rejects
+          path: patch-rejects/
+          if-no-files-found: ignore
+
+      # ==================== 构建摘要 ====================
+      - name: 构建摘要
+        if: success()
+        run: |
+          echo "========================================"
+          echo "  构建成功！"
+          echo "  下载 AnyKernel3 zip 后按教程刷入"
+          echo "========================================"
