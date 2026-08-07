@@ -22,31 +22,6 @@ on:
         required: true
         type: boolean
         default: true
-      use_zram:
-        description: "启用 ZRAM 压缩增强（LZ4HC/842 + ARM NEON 加速）"
-        required: false
-        type: boolean
-        default: true
-      use_bfq:
-        description: "启用 BFQ I/O 调度器（减少卡顿）"
-        required: false
-        type: boolean
-        default: true
-      use_bbg:
-        description: "启用 BBG 基带保护（防格基带）"
-        required: false
-        type: boolean
-        default: true
-      use_usb_storage:
-        description: "启用 exFAT + NTFS3 文件系统（U盘 OTG 读写）"
-        required: false
-        type: boolean
-        default: true
-      disable_debug_info:
-        description: "关闭 DEBUG_INFO（加速编译、节省磁盘）"
-        required: false
-        type: boolean
-        default: true
       cve_2026_43499_patch:
         description: "应用 CVE-2026-43499 安全补丁"
         required: false
@@ -55,7 +30,7 @@ on:
 
 jobs:
   build-motorola-kernel:
-    name: "G57 Power (mumba) 6.6.87 ReSukiSU+"
+    name: "G57 Power (mumba) 6.6.87 ReSukiSU"
     runs-on: ubuntu-latest
     timeout-minutes: 150
 
@@ -64,21 +39,15 @@ jobs:
       - name: 构建信息摘要
         run: |
           echo "========================================"
-          echo "  摩托罗拉 G57 Power 官方源码内核构建 v4"
-          echo "  + ZRAM + BFQ + BBG + exFAT/NTFS3"
-          echo "  - Re-Kernel (已移除)"
-          echo "  - DEBUG_INFO (可关闭加速编译)"
+          echo "  摩托罗拉 G57 Power 官方源码内核构建 v2"
+          echo "  (不依赖 Google 服务器, 纯 GitHub 源)"
           echo "========================================"
           echo "设备        : Moto G57 Power (mumba)"
           echo "固件 tag    : MMI-W1WAAS36.48-12-23-3"
           echo "内核        : 6.6.87 (android15-6.6)"
+          echo "芯片        : 骁龙 6s Gen 4 (parrot)"
           echo "KSU         : ReSukiSU (build-in)"
           echo "SUSFS       : ${{ inputs.use_susfs }}"
-          echo "ZRAM增强    : ${{ inputs.use_zram }}"
-          echo "BFQ调度器   : ${{ inputs.use_bfq }}"
-          echo "BBG基带保护 : ${{ inputs.use_bbg }}"
-          echo "exFAT/NTFS3 : ${{ inputs.use_usb_storage }}"
-          echo "关闭DEBUG   : ${{ inputs.disable_debug_info }}"
           echo "uname 输入  : ${{ inputs.device_uname }}"
           echo "========================================"
 
@@ -109,10 +78,12 @@ jobs:
           sudo apt-get install -y \
             build-essential bc bison flex python3 \
             libssl-dev libelf-dev dwarves \
-            clang lld llvm ccache zip wget
+            clang lld llvm ccache zip
 
           echo "Clang 版本:"
           clang --version | head -3
+          echo "LLD 版本:"
+          ld.lld --version | head -1
 
       # ==================== 配置 Git ====================
       - name: 配置 Git
@@ -138,6 +109,9 @@ jobs:
 
           echo "内核源码版本确认:"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel_src/Makefile
+
+          echo "设备配置确认 (mumba):"
+          cat kernel_src/arch/arm64/configs/vendor/ext_config/moto-parrot-mumba.config
 
       # ==================== 添加 ReSukiSU ====================
       - name: 添加 ReSukiSU (build-in 模式)
@@ -176,7 +150,7 @@ jobs:
           cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/* ./fs/
           cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/* ./include/linux/
 
-          # 6.6.50~92: base.c 头部上下文调整
+          # 6.6.50~92: base.c 头部上下文调整（87 属于此范围）
           if ! grep -qF '#include <linux/dma-buf.h>' fs/proc/base.c; then
             sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux\/dma-buf.h>' fs/proc/base.c
           fi
@@ -202,7 +176,7 @@ jobs:
           fi
 
           REJ_COUNT=$(find . -name "*.rej" | wc -l)
-          echo "SUSFS 补丁冲突文件数: $REJ_COUNT"
+          echo "SUSFS 补丁冲突文件数: $REJ_COUNT（0 为完美，>0 需要检查）"
           find . -name "*.rej" | head -10
 
       # ==================== CVE 安全补丁 ====================
@@ -213,64 +187,8 @@ jobs:
           if [ -f "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" ]; then
             bash "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" "6.6" "87" "$GITHUB_WORKSPACE/security_patch" || echo "::warning::CVE 补丁应用出现问题，继续构建"
           else
-            echo "未找到 CVE 补丁脚本，跳过"
+            echo "::warning::未找到 CVE 补丁脚本，跳过"
           fi
-
-      # ==================== ZRAM 压缩增强 ====================
-      - name: 集成 ZRAM 压缩增强（LZ4HC/842 + ARM NEON 加速）
-        if: inputs.use_zram
-        working-directory: kernel_src
-        run: |
-          echo "=== 集成 ZRAM 压缩增强 ==="
-
-          ZRAM_DIR="$GITHUB_WORKSPACE/zram"
-
-          if [ -d "$ZRAM_DIR/lz4" ]; then
-            echo "替换 LZ4 源码为 NEON 加速版..."
-            cp -f "$ZRAM_DIR/lz4/lz4.c" lib/lz4/lz4_decompress.c 2>/dev/null || true
-            cp -f "$ZRAM_DIR/lz4/lz4.h" lib/lz4/ 2>/dev/null || true
-            cp -f "$ZRAM_DIR/lz4/lz4hc.c" lib/lz4/ 2>/dev/null || true
-            cp -f "$ZRAM_DIR/lz4/lz4hc.h" lib/lz4/ 2>/dev/null || true
-
-            if [ -d "$ZRAM_DIR/lz4/lz4armv8" ]; then
-              mkdir -p lib/lz4/lz4armv8
-              cp -f "$ZRAM_DIR/lz4/lz4armv8/"* lib/lz4/lz4armv8/ 2>/dev/null || true
-            fi
-
-            if [ -f "$ZRAM_DIR/include/linux/lz4.h" ]; then
-              cp -f "$ZRAM_DIR/include/linux/lz4.h" include/linux/lz4.h
-            fi
-
-            cp -f "$ZRAM_DIR/lz4/Makefile" lib/lz4/Makefile 2>/dev/null || true
-            echo "LZ4 NEON 源码已复制"
-          fi
-
-          if [ -f "$ZRAM_DIR/apply_lz4_neon.sh" ]; then
-            echo "应用 LZ4 NEON 调用补丁..."
-            bash "$ZRAM_DIR/apply_lz4_neon.sh" || echo "::warning::部分 NEON 补丁可能未应用，继续构建"
-          fi
-
-          echo "ZRAM 压缩增强集成完成"
-
-      # ==================== BBG 基带保护 ====================
-      - name: 集成 BBG 基带保护
-        if: inputs.use_bbg
-        working-directory: kernel_src
-        run: |
-          echo "=== 集成 BBG 基带保护 ==="
-          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || {
-            echo "::warning::BBG 安装脚本执行失败，尝试手动安装..."
-            TMP_BBG=/tmp/baseband-guard
-            rm -rf "$TMP_BBG"
-            git clone --depth=1 https://github.com/vc-teahouse/Baseband-guard.git "$TMP_BBG" || {
-              echo "::warning::BBG 克隆失败，跳过"
-              exit 0
-            }
-            if [ -f "$TMP_BBG/setup.sh" ]; then
-              bash "$TMP_BBG/setup.sh" || echo "::warning::BBG 手动安装失败，跳过"
-            fi
-          }
-          echo "BBG 基带保护集成完成"
 
       # ==================== 配置内核版本字符串 ====================
       - name: 配置内核版本字符串（对齐 uname）
@@ -280,34 +198,36 @@ jobs:
           SUFFIX=$(echo "$FULL_UNAME" | sed -E 's/^6\.6\.[0-9]+//')
 
           if [ -z "$SUFFIX" ]; then
-            echo "::error::无法从输入中解析出 localversion 后缀"
+            echo "::error::无法从输入中解析出 localversion 后缀，请确认填写的是完整 uname -r 输出"
             exit 1
           fi
 
           echo "目标内核版本字符串: 6.6.87$SUFFIX"
 
+          # 去掉 -dirty
           sed -i 's/-dirty//' ./scripts/setlocalversion || true
+
+          # 6.6 新格式 setlocalversion：硬编码输出
           perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"$SUFFIX"'"/s' ./scripts/setlocalversion || true
 
           tail -3 ./scripts/setlocalversion
 
+          # 对齐原厂编译时间戳（/proc/version 显示用）
           echo "KBUILD_BUILD_TIMESTAMP=Thu Oct 23 14:31:17 UTC 2025" >> $GITHUB_ENV
           echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
 
-      # ==================== 写入全部内核配置 ====================
-      - name: 写入内核配置（KSU + SUSFS + ZRAM + BFQ + BBG + exFAT/NTFS3）
+      # ==================== 写入 KSU/SUSFS 配置 ====================
+      - name: 写入 KSU/SUSFS 配置
         working-directory: kernel_src
         run: |
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
-          # --- KSU 基础 ---
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU=y
           CONFIG_TMPFS_XATTR=y
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          # --- SUSFS ---
           if [ "${{ inputs.use_susfs }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
@@ -323,96 +243,39 @@ jobs:
           EOF
           fi
 
-          # --- ZRAM 压缩增强 ---
-          if [ "${{ inputs.use_zram }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_ZRAM=y
-          CONFIG_ZRAM_WRITEBACK=y
-          CONFIG_ZRAM_MULTI_COMP=y
-          CONFIG_ZSMALLOC=y
-          CONFIG_CRYPTO_LZ4HC=y
-          CONFIG_CRYPTO_LZ4K=y
-          CONFIG_CRYPTO_842=y
-          CONFIG_CRYPTO_LZ4=y
-          CONFIG_CRYPTO_LZO=y
-          EOF
-          fi
-
-          # --- BFQ I/O 调度器 ---
-          if [ "${{ inputs.use_bfq }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_IOSCHED_BFQ=y
-          CONFIG_BFQ_GROUP_IOSCHED=y
-          EOF
-          fi
-
-          # --- BBG 基带保护 ---
-          if [ "${{ inputs.use_bbg }}" = "true" ]; then
-            echo "CONFIG_BBG=y" >> "$DEFCONFIG"
-            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig 2>/dev/null || true
-          fi
-
-          # --- exFAT + NTFS3 文件系统（U盘 OTG）---
-          if [ "${{ inputs.use_usb_storage }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_EXFAT_FS=y
-          CONFIG_NTFS3_FS=y
-          CONFIG_VFAT_FS=y
-          CONFIG_FAT_DEFAULT_CODEPAGE=437
-          CONFIG_FAT_DEFAULT_IOCHARSET="utf8"
-          EOF
-          fi
-
-          # --- 关闭 DEBUG_INFO（加速编译）---
-          if [ "${{ inputs.disable_debug_info }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          # CONFIG_DEBUG_INFO_DWARF5 is not set
-          CONFIG_DEBUG_INFO_NONE=y
-          # CONFIG_DEBUG_INFO_BTF is not set
-          # CONFIG_DEBUG_INFO_COMPRESSED_ZSTD is not set
-          EOF
-          fi
-
           # 去掉行首缩进
           sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
 
-          echo "=== 已追加的全部配置 ==="
-          tail -40 "$DEFCONFIG"
+          # === 增强功能（纯配置项，不改源码）===
+          cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_IOSCHED_BFQ=y
+          CONFIG_BFQ_GROUP_IOSCHED=y
+          CONFIG_EXFAT_FS=y
+          CONFIG_NTFS3_FS=y
+          CONFIG_VFAT_FS=y
+          EOF
+          sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
+
+          echo "=== 已追加的配置 ==="
+          tail -20 "$DEFCONFIG"
 
       # ==================== 编译内核 ====================
       - name: 编译内核
         working-directory: kernel_src
         run: |
+          set -ex
+
+          # 生成配置
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
 
-          echo "=== 关键配置确认 ==="
-          grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_ZRAM=|^CONFIG_IOSCHED_BFQ=|^CONFIG_BBG=|^CONFIG_EXFAT_FS=|^CONFIG_NTFS3_FS=|^CONFIG_DEBUG_INFO" .config || true
+          # 确认 KSU 配置生效
+          grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=" .config || true
 
-          # 编译内核（关闭 set -e 和 pipefail，确保错误信息能被捕获）
-          set +e
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 > /tmp/build.log
-          BUILD_EXIT=$?
-          set -e
+          # 编译内核镜像
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tail -80
 
-          if [ $BUILD_EXIT -ne 0 ]; then
-            echo ""
-            echo "========================================"
-            echo "  编译失败！Exit code: $BUILD_EXIT"
-            echo "========================================"
-            echo ""
-            echo "=== 错误信息提取 ==="
-            grep -iE "error:|fatal:|undefined|cannot find|No such|No rule|multiple def|relocation|ld.lld:.*error" /tmp/build.log | grep -v "^make" | head -40
-            echo ""
-            echo "=== 最后 50 行完整日志 ==="
-            tail -50 /tmp/build.log
-            exit 1
-          fi
-
-          echo "=== 编译成功 ==="
-          ls -la arch/arm64/boot/Image* 2>/dev/null || {
-            echo "::error::编译产物 Image 不存在"
-            exit 1
-          }
+          echo "=== 编译产物 ==="
+          ls -la arch/arm64/boot/
 
       # ==================== 验证内核 ====================
       - name: 验证内核版本字符串
@@ -423,9 +286,9 @@ jobs:
           echo "Image 内版本信息: $ACTUAL"
 
           if echo "$ACTUAL" | grep -qF "$EXPECTED"; then
-            echo "✅ 内核版本字符串与原厂一致"
+            echo "✅ 内核版本字符串与原厂一致: $EXPECTED"
           else
-            echo "::warning::内核版本字符串与预期不完全一致"
+            echo "::warning::内核版本字符串与预期不完全一致，请检查（不影响基本功能，但可能影响模块兼容）"
           fi
 
       # ==================== 创建 AnyKernel3 刷机包 ====================
@@ -439,7 +302,7 @@ jobs:
           cp kernel_src/arch/arm64/boot/Image AnyKernel3/Image
 
           cd AnyKernel3
-          ZIP_NAME="ReSukiSU-mumba-G57Power-6.6.87-Enhanced-AnyKernel3.zip"
+          ZIP_NAME="ReSukiSU-mumba-G57Power-6.6.87-AnyKernel3.zip"
           zip -r9 "../$ZIP_NAME" ./*
 
           echo "打包完成:"
@@ -472,7 +335,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-G57Power-6.6.87-Enhanced
+          name: ReSukiSU-mumba-G57Power-6.6.87
           path: '*AnyKernel3.zip'
           compression-level: 0
           retention-days: 30
@@ -490,16 +353,6 @@ jobs:
         if: success()
         run: |
           echo "========================================"
-          echo "  构建成功！增强版内核 v4"
-          echo "  功能清单:"
-          echo "  ✅ ReSukiSU (build-in)"
-          echo "  ✅ SUSFS (Root 隐藏)"
-          echo "  ✅ ZRAM 压缩增强 (NEON 加速)"
-          echo "  ✅ BFQ I/O 调度器"
-          echo "  ✅ BBG 基带保护"
-          echo "  ✅ exFAT + NTFS3 (U盘 OTG)"
-          echo "  ✅ BBR 拥塞控制 (内核自带)"
-          echo "  ✅ WireGuard VPN (内核自带)"
-          echo "  ✅ OverlayFS (内核自带)"
-          echo "  ⚡ DEBUG_INFO 已关闭 (编译更快)"
+          echo "  构建成功！"
+          echo "  下载 AnyKernel3 zip 后按教程刷入"
           echo "========================================"
