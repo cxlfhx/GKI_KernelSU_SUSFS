@@ -37,8 +37,13 @@ on:
         required: false
         type: boolean
         default: true
-      use_rekernel:
-        description: "启用 Re-Kernel（内核崩溃自动重启）"
+      use_usb_storage:
+        description: "启用 exFAT + NTFS3 文件系统（U盘 OTG 读写）"
+        required: false
+        type: boolean
+        default: true
+      disable_debug_info:
+        description: "关闭 DEBUG_INFO（加速编译、节省磁盘）"
         required: false
         type: boolean
         default: true
@@ -59,19 +64,21 @@ jobs:
       - name: 构建信息摘要
         run: |
           echo "========================================"
-          echo "  摩托罗拉 G57 Power 官方源码内核构建 v3"
-          echo "  + ZRAM增强 + BFQ + BBG + Re-Kernel"
+          echo "  摩托罗拉 G57 Power 官方源码内核构建 v4"
+          echo "  + ZRAM + BFQ + BBG + exFAT/NTFS3"
+          echo "  - Re-Kernel (已移除)"
+          echo "  - DEBUG_INFO (可关闭加速编译)"
           echo "========================================"
           echo "设备        : Moto G57 Power (mumba)"
           echo "固件 tag    : MMI-W1WAAS36.48-12-23-3"
           echo "内核        : 6.6.87 (android15-6.6)"
-          echo "芯片        : 骁龙 6s Gen 4 (parrot)"
           echo "KSU         : ReSukiSU (build-in)"
           echo "SUSFS       : ${{ inputs.use_susfs }}"
           echo "ZRAM增强    : ${{ inputs.use_zram }}"
           echo "BFQ调度器   : ${{ inputs.use_bfq }}"
           echo "BBG基带保护 : ${{ inputs.use_bbg }}"
-          echo "Re-Kernel   : ${{ inputs.use_rekernel }}"
+          echo "exFAT/NTFS3 : ${{ inputs.use_usb_storage }}"
+          echo "关闭DEBUG   : ${{ inputs.disable_debug_info }}"
           echo "uname 输入  : ${{ inputs.device_uname }}"
           echo "========================================"
 
@@ -216,36 +223,28 @@ jobs:
         run: |
           echo "=== 集成 ZRAM 压缩增强 ==="
 
-          # 1. 替换 lib/lz4/ 下的 LZ4 源码为优化版本
-          # fork 仓库的 zram/lz4/ 目录包含 NEON 加速版 LZ4
           ZRAM_DIR="$GITHUB_WORKSPACE/zram"
 
           if [ -d "$ZRAM_DIR/lz4" ]; then
             echo "替换 LZ4 源码为 NEON 加速版..."
-            # 复制优化版 LZ4 源码
             cp -f "$ZRAM_DIR/lz4/lz4.c" lib/lz4/lz4_decompress.c 2>/dev/null || true
             cp -f "$ZRAM_DIR/lz4/lz4.h" lib/lz4/ 2>/dev/null || true
             cp -f "$ZRAM_DIR/lz4/lz4hc.c" lib/lz4/ 2>/dev/null || true
             cp -f "$ZRAM_DIR/lz4/lz4hc.h" lib/lz4/ 2>/dev/null || true
 
-            # 复制 ARM64 NEON 加速汇编代码
             if [ -d "$ZRAM_DIR/lz4/lz4armv8" ]; then
               mkdir -p lib/lz4/lz4armv8
               cp -f "$ZRAM_DIR/lz4/lz4armv8/"* lib/lz4/lz4armv8/ 2>/dev/null || true
             fi
 
-            # 复制兼容性头文件
             if [ -f "$ZRAM_DIR/include/linux/lz4.h" ]; then
               cp -f "$ZRAM_DIR/include/linux/lz4.h" include/linux/lz4.h
             fi
 
-            # 复制 Makefile
             cp -f "$ZRAM_DIR/lz4/Makefile" lib/lz4/Makefile 2>/dev/null || true
-
             echo "LZ4 NEON 源码已复制"
           fi
 
-          # 2. 应用 NEON 补丁（修改 crypto/lz4.c、crypto/lz4hc.c、fs/f2fs/compress.c）
           if [ -f "$ZRAM_DIR/apply_lz4_neon.sh" ]; then
             echo "应用 LZ4 NEON 调用补丁..."
             bash "$ZRAM_DIR/apply_lz4_neon.sh" || echo "::warning::部分 NEON 补丁可能未应用，继续构建"
@@ -259,83 +258,19 @@ jobs:
         working-directory: kernel_src
         run: |
           echo "=== 集成 BBG 基带保护 ==="
-          # 使用 vc-teahouse/Baseband-guard 官方安装脚本
           wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || {
             echo "::warning::BBG 安装脚本执行失败，尝试手动安装..."
-            # 手动克隆并安装
             TMP_BBG=/tmp/baseband-guard
             rm -rf "$TMP_BBG"
             git clone --depth=1 https://github.com/vc-teahouse/Baseband-guard.git "$TMP_BBG" || {
               echo "::warning::BBG 克隆失败，跳过"
               exit 0
             }
-            # 如果有手动安装脚本
             if [ -f "$TMP_BBG/setup.sh" ]; then
-              bash "$TMP_BBG/setup.sh" || echo "::warning::BBG 手动安装也失败，跳过"
+              bash "$TMP_BBG/setup.sh" || echo "::warning::BBG 手动安装失败，跳过"
             fi
           }
-
           echo "BBG 基带保护集成完成"
-
-      # ==================== Re-Kernel ====================
-      - name: 集成 Re-Kernel（内核崩溃自动重启）
-        if: inputs.use_rekernel
-        working-directory: kernel_src
-        run: |
-          echo "=== 集成 Re-Kernel ==="
-          TMP_REKERNEL=/tmp/rekernel
-          rm -rf "$TMP_REKERNEL"
-          git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git "$TMP_REKERNEL"
-
-          # 准备驱动源码
-          mkdir -p drivers/rekernel
-          cp "$TMP_REKERNEL/LKM-Source/rekernel.c" drivers/rekernel/
-          cp "$TMP_REKERNEL/LKM-Source/rekernel.h" drivers/rekernel/
-
-          # 生成 Kconfig
-          cat > drivers/rekernel/Kconfig << 'EOF'
-          menu "Re:Kernel"
-          config REKERNEL
-              bool "Re:Kernel support (GKI Vendor Hooks)"
-              default y
-              help
-                Enable Re-Kernel support via GKI Vendor Hooks.
-          config REKERNEL_NETWORK
-              bool "Re:Kernel NetReceive unfreeze support"
-              depends on REKERNEL
-              default n
-          endmenu
-          EOF
-          sed -i 's/^[[:space:]]*//' drivers/rekernel/Kconfig
-
-          # 生成 Makefile
-          cat > drivers/rekernel/Makefile << 'EOF'
-          obj-$(CONFIG_REKERNEL) += rekernel.o
-          ccflags-$(CONFIG_REKERNEL_NETWORK) += -DNETWORK_FILTER
-          EOF
-          sed -i 's/^[[:space:]]*//' drivers/rekernel/Makefile
-
-          # 挂载到驱动树
-          if ! grep -qF 'source "drivers/rekernel/Kconfig"' drivers/Kconfig; then
-            sed -i '/^endmenu$/i source "drivers/rekernel/Kconfig"' drivers/Kconfig
-          fi
-          if ! grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' drivers/Makefile; then
-            echo 'obj-$(CONFIG_REKERNEL) += rekernel/' >> drivers/Makefile
-          fi
-
-          # 启用内核版本宏 (6.6 -> KERNEL_6_6)
-          REKERNEL_H="drivers/rekernel/rekernel.h"
-          if grep -q "^// #define KERNEL_6_6$" "$REKERNEL_H"; then
-            sed -i "s|^// #define KERNEL_6_6$|#define KERNEL_6_6|" "$REKERNEL_H"
-            echo "已启用 KERNEL_6_6 宏"
-          fi
-
-          # 修正头文件包含路径
-          sed -i 's|#include <../android/binder_internal.h>|#include "../../drivers/android/binder_internal.h"|g' drivers/rekernel/rekernel.c
-          grep -qF '#include <linux/seq_file.h>' drivers/rekernel/rekernel.c || \
-            sed -i '/#include <trace\/hooks\/signal.h>/a #include <linux/seq_file.h>' drivers/rekernel/rekernel.c
-
-          echo "Re-Kernel 集成完成"
 
       # ==================== 配置内核版本字符串 ====================
       - name: 配置内核版本字符串（对齐 uname）
@@ -360,19 +295,19 @@ jobs:
           echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
 
       # ==================== 写入全部内核配置 ====================
-      - name: 写入内核配置（KSU + SUSFS + ZRAM + BFQ + BBG + Re-Kernel）
+      - name: 写入内核配置（KSU + SUSFS + ZRAM + BFQ + BBG + exFAT/NTFS3）
         working-directory: kernel_src
         run: |
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
-          # --- KSU 基础配置 ---
+          # --- KSU 基础 ---
           cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU=y
           CONFIG_TMPFS_XATTR=y
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          # --- SUSFS 配置 ---
+          # --- SUSFS ---
           if [ "${{ inputs.use_susfs }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_KSU_SUSFS=y
@@ -388,7 +323,7 @@ jobs:
           EOF
           fi
 
-          # --- ZRAM 压缩增强配置 ---
+          # --- ZRAM 压缩增强 ---
           if [ "${{ inputs.use_zram }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_ZRAM=y
@@ -403,7 +338,7 @@ jobs:
           EOF
           fi
 
-          # --- BFQ I/O 调度器配置 ---
+          # --- BFQ I/O 调度器 ---
           if [ "${{ inputs.use_bfq }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_IOSCHED_BFQ=y
@@ -411,18 +346,30 @@ jobs:
           EOF
           fi
 
-          # --- BBG 基带保护配置 ---
+          # --- BBG 基带保护 ---
           if [ "${{ inputs.use_bbg }}" = "true" ]; then
             echo "CONFIG_BBG=y" >> "$DEFCONFIG"
-            # 修改 security/Kconfig 添加 baseband_guard 到 LSM 默认链
             sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig 2>/dev/null || true
           fi
 
-          # --- Re-Kernel 配置 ---
-          if [ "${{ inputs.use_rekernel }}" = "true" ]; then
+          # --- exFAT + NTFS3 文件系统（U盘 OTG）---
+          if [ "${{ inputs.use_usb_storage }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_REKERNEL=y
-          CONFIG_REKERNEL_NETWORK=y
+          CONFIG_EXFAT_FS=y
+          CONFIG_NTFS3_FS=y
+          CONFIG_VFAT_FS=y
+          CONFIG_FAT_DEFAULT_CODEPAGE=437
+          CONFIG_FAT_DEFAULT_IOCHARSET="utf8"
+          EOF
+          fi
+
+          # --- 关闭 DEBUG_INFO（加速编译）---
+          if [ "${{ inputs.disable_debug_info }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          # CONFIG_DEBUG_INFO_DWARF5 is not set
+          CONFIG_DEBUG_INFO_NONE=y
+          # CONFIG_DEBUG_INFO_BTF is not set
+          # CONFIG_DEBUG_INFO_COMPRESSED_ZSTD is not set
           EOF
           fi
 
@@ -430,7 +377,7 @@ jobs:
           sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
 
           echo "=== 已追加的全部配置 ==="
-          tail -35 "$DEFCONFIG"
+          tail -40 "$DEFCONFIG"
 
       # ==================== 编译内核 ====================
       - name: 编译内核
@@ -438,14 +385,11 @@ jobs:
         run: |
           set -ex
 
-          # 生成配置
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
 
-          # 确认关键配置生效
           echo "=== 关键配置确认 ==="
-          grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_ZRAM=|^CONFIG_IOSCHED_BFQ=|^CONFIG_BBG=|^CONFIG_REKERNEL=|^CONFIG_CRYPTO_LZ4HC=" .config || true
+          grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_ZRAM=|^CONFIG_IOSCHED_BFQ=|^CONFIG_BBG=|^CONFIG_EXFAT_FS=|^CONFIG_NTFS3_FS=|^CONFIG_DEBUG_INFO" .config || true
 
-          # 编译内核镜像
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tail -80
 
           echo "=== 编译产物 ==="
@@ -527,12 +471,16 @@ jobs:
         if: success()
         run: |
           echo "========================================"
-          echo "  构建成功！增强版内核"
-          echo "  功能: ReSukiSU + SUSFS"
-          echo "  + ZRAM压缩增强(NEON加速)"
-          echo "  + BFQ I/O调度器"
-          echo "  + BBG基带保护"
-          echo "  + Re-Kernel崩溃重启"
-          echo "  BBR拥塞控制(内核自带)"
-          echo "  下载 AnyKernel3 zip 后刷入"
+          echo "  构建成功！增强版内核 v4"
+          echo "  功能清单:"
+          echo "  ✅ ReSukiSU (build-in)"
+          echo "  ✅ SUSFS (Root 隐藏)"
+          echo "  ✅ ZRAM 压缩增强 (NEON 加速)"
+          echo "  ✅ BFQ I/O 调度器"
+          echo "  ✅ BBG 基带保护"
+          echo "  ✅ exFAT + NTFS3 (U盘 OTG)"
+          echo "  ✅ BBR 拥塞控制 (内核自带)"
+          echo "  ✅ WireGuard VPN (内核自带)"
+          echo "  ✅ OverlayFS (内核自带)"
+          echo "  ⚡ DEBUG_INFO 已关闭 (编译更快)"
           echo "========================================"
