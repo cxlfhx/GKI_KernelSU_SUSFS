@@ -246,16 +246,6 @@ jobs:
           # 去掉行首缩进
           sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
 
-          # === 增强功能（纯配置项，不改源码）===
-          cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_IOSCHED_BFQ=y
-          CONFIG_BFQ_GROUP_IOSCHED=y
-          CONFIG_EXFAT_FS=y
-          CONFIG_NTFS3_FS=y
-          CONFIG_VFAT_FS=y
-          EOF
-          sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
-
           echo "=== 已追加的配置 ==="
           tail -20 "$DEFCONFIG"
 
