@@ -383,17 +383,36 @@ jobs:
       - name: 编译内核
         working-directory: kernel_src
         run: |
-          set -ex
-
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
 
           echo "=== 关键配置确认 ==="
           grep -E "^CONFIG_KSU=|^CONFIG_KSU_SUSFS=|^CONFIG_ZRAM=|^CONFIG_IOSCHED_BFQ=|^CONFIG_BBG=|^CONFIG_EXFAT_FS=|^CONFIG_NTFS3_FS=|^CONFIG_DEBUG_INFO" .config || true
 
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tail -80
+          # 编译内核（关闭 set -e 和 pipefail，确保错误信息能被捕获）
+          set +e
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 > /tmp/build.log
+          BUILD_EXIT=$?
+          set -e
 
-          echo "=== 编译产物 ==="
-          ls -la arch/arm64/boot/
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo ""
+            echo "========================================"
+            echo "  编译失败！Exit code: $BUILD_EXIT"
+            echo "========================================"
+            echo ""
+            echo "=== 错误信息提取 ==="
+            grep -iE "error:|fatal:|undefined|cannot find|No such|No rule|multiple def|relocation|ld.lld:.*error" /tmp/build.log | grep -v "^make" | head -40
+            echo ""
+            echo "=== 最后 50 行完整日志 ==="
+            tail -50 /tmp/build.log
+            exit 1
+          fi
+
+          echo "=== 编译成功 ==="
+          ls -la arch/arm64/boot/Image* 2>/dev/null || {
+            echo "::error::编译产物 Image 不存在"
+            exit 1
+          }
 
       # ==================== 验证内核 ====================
       - name: 验证内核版本字符串
