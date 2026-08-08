@@ -1,4 +1,4 @@
-name: 最终版本摩托罗拉 G57 Power 官方源码内核构建
+name: LAST摩托罗拉 G57 Power 官方源码内核构建
 
 permissions:
   contents: write
@@ -43,12 +43,12 @@ on:
         type: boolean
         default: true
       use_rekernel:
-        description: "启用 Re-Kernel（内核崩溃自动重启）"
+        description: "启用 Re-Kernel（与6.6内核不兼容，已禁用）"
         required: false
         type: boolean
-        default: true
+        default: false
       use_mem_opt:
-        description: "启用 MGLRU + KSM（内存优化）"
+        description: "启用 KSM（内存同页合并）"
         required: false
         type: boolean
         default: true
@@ -58,10 +58,10 @@ on:
         type: boolean
         default: true
       use_net_opt:
-        description: "启用 TCP Fast Open（网络优化）"
+        description: "启用 TCP Fast Open（内核已有，无需开启）"
         required: false
         type: boolean
-        default: true
+        default: false
       disable_debug_info:
         description: "关闭 DEBUG_INFO（加速编译、产物更小）"
         required: false
@@ -313,24 +313,15 @@ jobs:
           CONFIG_REKERNEL_NETWORK=y
           EOF
           fi
-          # 内存优化：MGLRU + KSM
+          # 内存优化：KSM（MGLRU 在此内核版本不存在）
           if [ "${{ inputs.use_mem_opt }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_MGLRU=y
-          CONFIG_KSM=y
-          EOF
+            echo "CONFIG_KSM=y" >> "$DEFCONFIG"
           fi
           # 额外 I/O 调度器
           if [ "${{ inputs.use_extra_sched }}" = "true" ]; then
             cat >> "$DEFCONFIG" << 'EOF'
           CONFIG_MQ_IOSCHED_DEADLINE=y
           CONFIG_MQ_IOSCHED_KYBER=y
-          EOF
-          fi
-          # 网络优化：TCP Fast Open
-          if [ "${{ inputs.use_net_opt }}" = "true" ]; then
-            cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_TCP_FASTOPEN=y
           EOF
           fi
           # 关闭 DEBUG_INFO（加速编译、产物更小）
@@ -407,15 +398,15 @@ jobs:
         if: success()
         run: |
           echo "========================================"
-          echo "  构建成功！全功能版 v7"
+          echo "  构建成功！全功能版 v7（本地验证）"
           echo "  ✅ ReSukiSU + SUSFS"
           echo "  ✅ ZRAM NEON + LZ4HC/842"
           echo "  ✅ BFQ + Deadline + Kyber I/O"
           echo "  ✅ BBG 基带保护"
-          echo "  ✅ Re-Kernel 崩溃重启"
-          echo "  ✅ MGLRU + KSM 内存优化"
+          echo "  ✅ KSM 内存同页合并"
           echo "  ✅ exFAT + NTFS3 U盘"
-          echo "  ✅ TCP Fast Open"
           echo "  ✅ BBR + WireGuard (自带)"
           echo "  ⚡ DEBUG_INFO 已关闭"
+          echo "  ❌ Re-Kernel (与6.6不兼容)"
+          echo "  ❌ MGLRU (Kconfig不存在)"
           echo "========================================"
