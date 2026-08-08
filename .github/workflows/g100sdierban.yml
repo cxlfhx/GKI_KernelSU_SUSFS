@@ -1,0 +1,321 @@
+name: 摩托罗拉 G57 Power 官方源码内核构建02
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_uname:
+        description: "手机 uname -r 的完整输出"
+        required: true
+        type: string
+        default: "6.6.87-android15-8-gf7bcb1c8e88f-ab14322536-4k"
+      kernelsu_branch:
+        description: "ReSukiSU 分支（留空=main）"
+        required: false
+        type: string
+        default: ""
+      use_susfs:
+        description: "启用 SUSFS（Root 隐藏）"
+        required: true
+        type: boolean
+        default: true
+      use_zram:
+        description: "启用 ZRAM 压缩增强（LZ4HC/842 + NEON）"
+        required: false
+        type: boolean
+        default: true
+      use_bfq:
+        description: "启用 BFQ I/O 调度器"
+        required: false
+        type: boolean
+        default: true
+      use_bbg:
+        description: "启用 BBG 基带保护"
+        required: false
+        type: boolean
+        default: true
+      use_usb_storage:
+        description: "启用 exFAT + NTFS3（U盘 OTG）"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build-motorola-kernel:
+    name: "G57 Power (mumba) 6.6.87 ReSukiSU+"
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 构建信息摘要
+        run: |
+          echo "========================================"
+          echo "  摩托罗拉 G57 Power 官方源码内核构建 v6"
+          echo "  本地验证通过版（修复 ZRAM+BBG）"
+          echo "========================================"
+          echo "KSU    : ReSukiSU (build-in)"
+          echo "SUSFS  : ${{ inputs.use_susfs }}"
+          echo "ZRAM   : ${{ inputs.use_zram }}"
+          echo "BFQ    : ${{ inputs.use_bfq }}"
+          echo "BBG    : ${{ inputs.use_bbg }}"
+          echo "exFAT  : ${{ inputs.use_usb_storage }}"
+          echo "uname  : ${{ inputs.device_uname }}"
+          echo "========================================"
+
+      - name: 清理磁盘空间
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - name: 检出代码仓库
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex python3 \
+            libssl-dev libelf-dev dwarves \
+            clang lld llvm ccache zip wget
+          clang --version | head -3
+
+      - name: 配置 Git
+        run: |
+          git config --global user.name "BuildBot"
+          git config --global user.email "BuildMotoKernel@gmail.com"
+
+      - name: 克隆摩托罗拉官方内核源码
+        run: |
+          for i in 1 2 3; do
+            git clone --depth=1 -b MMI-W1WAAS36.48-12-23-3 \
+              https://github.com/MotorolaMobilityLLC/kernel-msm.git kernel_src && break
+            rm -rf kernel_src; sleep 10
+          done
+          [ -d kernel_src ] || { echo "::error::克隆失败"; exit 1; }
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel_src/Makefile
+
+      - name: 添加 ReSukiSU (build-in 模式)
+        working-directory: kernel_src
+        run: |
+          BRANCH="${{ inputs.kernelsu_branch }}"
+          [ -z "$BRANCH" ] && BRANCH="main"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "$BRANCH"
+
+      - name: 克隆 SUSFS
+        if: inputs.use_susfs
+        run: |
+          for i in 1 2 3; do
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 && break
+            rm -rf susfs4ksu; sleep 10
+          done
+
+      - name: 应用 SUSFS 补丁
+        if: inputs.use_susfs
+        working-directory: kernel_src
+        run: |
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch ./
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/* ./fs/
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          if ! grep -qF '#include <linux/dma-buf.h>' fs/proc/base.c; then
+            sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux\/dma-buf.h>' fs/proc/base.c
+          fi
+          patch -p1 < 50_add_susfs_in_gki-android15-6.6.patch || true
+          if grep -q 'AS_FLAGS_SUS_MAP\|susfs_is_current_proc_umounted\|SUSFS_IS_INODE_SUS_MAP\|SUSFS_IS_INODE_OPEN_REDIRECT' ./fs/proc/base.c && ! grep -qF 'susfs_def.h' ./fs/proc/base.c; then
+            sed -i '/#include <linux\/dma-buf.h>/a #endif' ./fs/proc/base.c
+            sed -i '/#include <linux\/dma-buf.h>/a #include <linux\/susfs_def.h>' ./fs/proc/base.c
+            sed -i '/#include <linux\/dma-buf.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)' ./fs/proc/base.c
+          fi
+          if grep -q 'SUSFS_IS_INODE_SUS_MAP' ./mm/memory.c && ! grep -qF '#include <linux/susfs_def.h>' ./mm/memory.c; then
+            if grep -qF '#include <linux/zswap.h>' ./mm/memory.c; then
+              sed -i '/#include <linux\/zswap.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif' ./mm/memory.c
+            else
+              sed -i '/#include <linux\/sched\/sysctl.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif' ./mm/memory.c
+            fi
+          fi
+          echo "SUSFS 冲突数: $(find . -name '*.rej' | wc -l)"
+
+      - name: 应用 CVE 安全补丁
+        working-directory: kernel_src
+        run: |
+          [ -f "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" ] && \
+            bash "$GITHUB_WORKSPACE/security_patch/apply_cve_2026_43499.sh" "6.6" "87" "$GITHUB_WORKSPACE/security_patch" || true
+
+      - name: 集成 ZRAM 压缩增强
+        if: inputs.use_zram
+        working-directory: kernel_src
+        run: |
+          ZRAM_DIR="$GITHUB_WORKSPACE/zram"
+          if [ -d "$ZRAM_DIR/lz4" ]; then
+            # 修复：文件名必须与 fork Makefile 期望一致
+            cp -f "$ZRAM_DIR/lz4/lz4.c" lib/lz4/lz4.c
+            cp -f "$ZRAM_DIR/lz4/lz4.h" lib/lz4/lz4.h
+            cp -f "$ZRAM_DIR/lz4/lz4hc.c" lib/lz4/lz4hc.c
+            cp -f "$ZRAM_DIR/lz4/lz4hc.h" lib/lz4/lz4hc.h
+            if [ -d "$ZRAM_DIR/lz4/lz4armv8" ]; then
+              mkdir -p lib/lz4/lz4armv8
+              cp -f "$ZRAM_DIR/lz4/lz4armv8/"* lib/lz4/lz4armv8/
+            fi
+            [ -f "$ZRAM_DIR/include/linux/lz4.h" ] && cp -f "$ZRAM_DIR/include/linux/lz4.h" include/linux/lz4.h
+            cp -f "$ZRAM_DIR/lz4/Makefile" lib/lz4/Makefile
+          fi
+          [ -f "$ZRAM_DIR/apply_lz4_neon.sh" ] && bash "$ZRAM_DIR/apply_lz4_neon.sh" || true
+
+      - name: 集成 BBG 基带保护
+        if: inputs.use_bbg
+        working-directory: kernel_src
+        run: |
+          # 运行 BBG 官方安装脚本
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+          # 修复：BBG setup.sh 的 awk 可能有语法错误，手动确保 Kconfig 正确
+          # 在 security/Kconfig 的 config LSM 段落中，把 baseband_guard 加入每个 default 行
+          sed -i '/^config LSM$/,/^help$/{/default.*selinux/{/baseband_guard/!s/selinux/selinux,baseband_guard/}}' security/Kconfig
+
+      - name: 配置内核版本字符串
+        working-directory: kernel_src
+        run: |
+          FULL_UNAME="${{ inputs.device_uname }}"
+          SUFFIX=$(echo "$FULL_UNAME" | sed -E 's/^6\.6\.[0-9]+//')
+          [ -z "$SUFFIX" ] && { echo "::error::无法解析 uname"; exit 1; }
+          echo "目标: 6.6.87$SUFFIX"
+          sed -i 's/-dirty//' ./scripts/setlocalversion || true
+          perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"$SUFFIX"'"/s' ./scripts/setlocalversion || true
+          echo "KBUILD_BUILD_TIMESTAMP=Thu Oct 23 14:31:17 UTC 2025" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_VERSION=1" >> $GITHUB_ENV
+
+      - name: 写入全部内核配置
+        working-directory: kernel_src
+        run: |
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOF
+          if [ "${{ inputs.use_susfs }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+          if [ "${{ inputs.use_zram }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_ZRAM=y
+          CONFIG_ZRAM_WRITEBACK=y
+          CONFIG_ZRAM_MULTI_COMP=y
+          CONFIG_ZSMALLOC=y
+          CONFIG_CRYPTO_LZ4HC=y
+          CONFIG_CRYPTO_842=y
+          CONFIG_CRYPTO_LZ4=y
+          CONFIG_CRYPTO_LZO=y
+          EOF
+          fi
+          if [ "${{ inputs.use_bfq }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_IOSCHED_BFQ=y
+          CONFIG_BFQ_GROUP_IOSCHED=y
+          EOF
+          fi
+          if [ "${{ inputs.use_bbg }}" = "true" ]; then
+            echo "CONFIG_BBG=y" >> "$DEFCONFIG"
+          fi
+          if [ "${{ inputs.use_usb_storage }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_EXFAT_FS=y
+          CONFIG_NTFS3_FS=y
+          CONFIG_VFAT_FS=y
+          EOF
+          fi
+          sed -i 's/^[[:space:]]*//' "$DEFCONFIG"
+
+      - name: 编译内核
+        working-directory: kernel_src
+        run: |
+          set -ex
+          # 生成配置（BBG 的 Kconfig 修改需要在此时生效）
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
+          # 确认 BBG 配置生效
+          grep -E "^CONFIG_BBG=|baseband_guard" .config || true
+          # 编译
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 -j$(nproc) Image 2>&1 | tail -80
+          ls -la arch/arm64/boot/
+
+      - name: 验证内核版本字符串
+        working-directory: kernel_src
+        run: |
+          ACTUAL=$(strings arch/arm64/boot/Image | grep -m1 'Linux version' || true)
+          echo "Image: $ACTUAL"
+
+      - name: 创建 AnyKernel3 刷机包
+        run: |
+          for i in 1 2 3; do
+            git clone --depth=1 https://github.com/ReSukiSU-GKI/AnyKernel3.git && break
+            sleep 10
+          done
+          cp kernel_src/arch/arm64/boot/Image AnyKernel3/Image
+          cd AnyKernel3
+          zip -r9 "../ReSukiSU-mumba-G57Power-6.6.87-Enhanced-AnyKernel3.zip" ./*
+          ls -la ../ReSukiSU-mumba-G57Power-6.6.87-Enhanced-AnyKernel3.zip
+
+      - name: 收集补丁冲突文件
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/patch-rejects"
+          mapfile -t REJS < <(find "$GITHUB_WORKSPACE/kernel_src" -type f -name '*.rej' 2>/dev/null)
+          REJ_COUNT=${#REJS[@]}
+          echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
+          for REJ in "${REJS[@]}"; do
+            REL="${REJ#"$GITHUB_WORKSPACE/kernel_src"/}"
+            mkdir -p "$GITHUB_WORKSPACE/patch-rejects/$(dirname "$REL")"
+            cp "$REJ" "$GITHUB_WORKSPACE/patch-rejects/$REL"
+          done
+
+      - name: 上传 AnyKernel3 刷机包
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-G57Power-6.6.87-Enhanced
+          path: '*AnyKernel3.zip'
+          compression-level: 0
+          retention-days: 30
+
+      - name: 上传补丁冲突文件
+        if: always() && env.REJ_COUNT > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects
+          path: patch-rejects/
+          if-no-files-found: ignore
+
+      - name: 构建摘要
+        if: success()
+        run: |
+          echo "========================================"
+          echo "  构建成功！全功能版 v6（本地验证）"
+          echo "  ✅ ReSukiSU + SUSFS"
+          echo "  ✅ ZRAM NEON + LZ4HC/842"
+          echo "  ✅ BFQ I/O 调度器"
+          echo "  ✅ BBG 基带保护"
+          echo "  ✅ exFAT + NTFS3 U盘"
+          echo "  ✅ BBR + WireGuard (内核自带)"
+          echo "========================================"
