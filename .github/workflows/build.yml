@@ -182,6 +182,7 @@ jobs:
           echo "KSU 分支      : ${{ inputs.ksu_branch }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
+          echo "KPM 模式      : ${{ inputs.use_kpm }}"
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
           echo "BBG 补丁      : ${{ inputs.use_bbg }}"
           echo "Re-Kernel     : ${{ inputs.use_rekernel }}"
@@ -1423,12 +1424,17 @@ jobs:
           EOF
 
           if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "ReSukiSU" ] || [ "${{ inputs.ksu_variant }}" == "Next" ]; then
-            if [[ "${{ inputs.use_kpm }}" == enabled* ]] || [[ "${{ inputs.use_kpm }}" == patched* ]]; then
-              if ! grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
-                echo "错误: 已请求启用 KPM，但当前 KernelSU 代码未声明 CONFIG_KPM" >&2
+            if [[ "${{ inputs.use_kpm }}" == enabled* ]]; then
+              # in-tree KPM：仅当 KernelSU 源码声明了 CONFIG_KPM 时可用
+              if grep -RqsE '^[[:space:]]*config[[:space:]]+KPM([[:space:]]|$)' common KernelSU 2>/dev/null; then
+                echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+              else
+                echo "::error::已请求 in-tree KPM（enabled），但当前 KernelSU 代码未声明 CONFIG_KPM。ReSukiSU/SukiSU 请改用 patched 模式（构建后注入 KernelPatch）。" >&2
                 exit 1
               fi
-              echo "CONFIG_KPM=y" >> "$DEFCONFIG"
+            elif [[ "${{ inputs.use_kpm }}" == patched* ]]; then
+              # patched 模式：编译完成后由「应用 KPM 补丁」步骤注入 kpimg，无需任何 defconfig 变更
+              echo "KPM 模式: patched（构建后注入 KernelPatch kpimg，不修改 defconfig）"
             fi
           fi
 
@@ -1655,6 +1661,62 @@ jobs:
             echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
             echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE}"
             echo "如果日期不同或相差过远则补丁失效、编译失败"
+
+      # ==================== 应用 KPM 补丁 ====================
+      # patched 模式：向编译产物 Image 注入 SukiSU KernelPatch (kpimg)，提供 KPM 支持。
+      # patch_linux 内嵌 kpimg 与 kptools，离线运行，无需联网；KP superkey 固定为 123。
+      # 要求内核启用 CONFIG_KALLSYMS（GKI defconfig 默认满足）。
+      - name: 应用 KPM 补丁（KernelPatch 注入）
+        if: ${{ startsWith(inputs.use_kpm, 'patched') }}
+        run: |
+          set -euo pipefail
+
+          case "${{ inputs.android_version }}" in
+            android12|android13)
+              TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
+              ;;
+            android14|android15|android16)
+              TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+              ;;
+            *)
+              echo "::error::KPM: 不支持的 android_version: ${{ inputs.android_version }}"
+              exit 1
+              ;;
+          esac
+
+          if [ "${{ inputs.kernel_version }}" = "6.6" ]; then
+            echo "::warning::上游 SukiSU 构建对 6.6 内核默认跳过 KPM 注入（兼容性未完全保证），此处仍按设置继续。"
+          fi
+
+          test -f "$TARGET_PATH/Image" || { echo "::error::未找到 $TARGET_PATH/Image"; exit 1; }
+          PATCH_TOOL="$SUKISU_PATCHES/kpm/patch_linux"
+          test -f "$PATCH_TOOL" || { echo "::error::未找到 KPM 补丁工具: $PATCH_TOOL"; exit 1; }
+          chmod +x "$PATCH_TOOL"
+
+          ORIG_SIZE=$(stat -c%s "$TARGET_PATH/Image")
+          ORIG_MAGIC=$(head -c 4 "$TARGET_PATH/Image" | od -An -tx1 | tr -d ' \n')
+
+          cd "$TARGET_PATH"
+          rm -f oImage
+          "$PATCH_TOOL"
+
+          if [ ! -f oImage ]; then
+            echo "::error::KPM 补丁失败：未生成 oImage"
+            exit 1
+          fi
+          NEW_MAGIC=$(head -c 4 oImage | od -An -tx1 | tr -d ' \n')
+          if [ "$NEW_MAGIC" != "$ORIG_MAGIC" ]; then
+            echo "::error::oImage 头部 magic 异常: $ORIG_MAGIC -> $NEW_MAGIC"
+            exit 1
+          fi
+          NEW_SIZE=$(stat -c%s oImage)
+          if [ "$NEW_SIZE" -le "$ORIG_SIZE" ]; then
+            echo "::error::oImage 尺寸异常: $ORIG_SIZE -> $NEW_SIZE"
+            exit 1
+          fi
+
+          mv -f oImage Image
+          echo "KPM 补丁完成: Image $ORIG_SIZE -> $NEW_SIZE bytes (kpimg 已注入, superkey=123)"
 
       # ==================== 验证最终内核配置 ====================
       # ztc 严格模式下检查 Kconfig 解析后的 .config，避免仅向 defconfig 追加无效符号。
