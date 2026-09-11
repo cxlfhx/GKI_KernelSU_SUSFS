@@ -1,0 +1,184 @@
+# ============================================================
+# UP Mobile Mover Edition (天玑8200) 专用内核构建工作流
+# 基座: zzh20188/GKI_KernelSU_SUSFS (dev 分支)
+# 特性: ReSukiSU + SUSFS 全量 + KPM + BBG防格机 + ZRAM增强
+# 用法: 放到 .github/workflows/ 目录, 在 Actions 页面手动触发
+# ============================================================
+
+name: UP-Mover 内核构建 (5.10)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ==================== 版本基线 (必填, 须与手机原厂内核一致) ====================
+      baseline:
+        description: "内核基线 [子版本|安全补丁|revision] —— 必须先用 boot.img 查原厂内核版本再选!"
+        type: choice
+        default: "198|2024-01|r17"
+        options:
+          - "66|2022-01|r11"
+          - "81|2022-03|r11"
+          - "101|2022-04|r28"
+          - "110|2022-07|r1"
+          - "117|2022-09|r1"
+          - "136|2022-11|r15"
+          - "149|2023-01|r1"
+          - "160|2023-03|r1"
+          - "168|2023-04|r9"
+          - "177|2023-07|r3"
+          - "185|2023-09|r1"
+          - "198|2024-01|r17"
+          - "205|2024-03|r1"
+          - "209|2024-05|r13"
+          - "218|2024-08|r14"
+          - "226|2024-11|r8"
+          - "233|2025-02|r1"
+          - "236|2025-05|r1"
+          - "237|2025-06|r1"
+          - "240|2025-09|r1"
+          - "246|2025-12|r1"
+          - "X|lts|r1"
+
+      # ==================== KernelSU 变体 ====================
+      kernelsu_variant:
+        description: "KernelSU 变体 (推荐 ReSukiSU)"
+        type: choice
+        default: ReSukiSU
+        options:
+          - ReSukiSU
+          - SukiSU
+          - SukiSU(40726)
+          - SukiSU(40548)
+          - Official
+
+      # ==================== 功能开关 (默认已按极限优化+稳定调好) ====================
+      use_kpm:
+        description: "KPM 内核模块支持 (ReSukiSU 原生支持, 选 enabled)"
+        type: choice
+        default: "enabled (开启)"
+        options:
+          - "enabled (开启)"
+          - "disabled (关闭)"
+          - "patched (开启并修补，尚不支持)"
+      cancel_susfs:
+        description: "禁用 SUSFS (保持 false = 启用全量 SUSFS)"
+        type: boolean
+        default: false
+      use_bbg:
+        description: "启用 BBG 防格机 (ZTC 同款特性)"
+        type: boolean
+        default: true
+      use_zram:
+        description: "启用 ZRAM 增强算法"
+        type: boolean
+        default: true
+      cve_2026_43499_patch:
+        description: "应用 CVE-2026-43499 rtmutex 稳定性修复链"
+        type: boolean
+        default: true
+      use_rekernel:
+        description: "启用 Re-Kernel 驱动 (实验性, 默认关)"
+        type: boolean
+        default: false
+      droidspaces:
+        description: "Droidspaces 容器支持 (不需要保持 off)"
+        type: choice
+        default: "off"
+        options:
+          - "off"
+          - "678"
+          - "123"
+          - "345"
+      droidspaces_ntsync:
+        description: "Droidspaces NTSync (需先启用 Droidspaces)"
+        type: boolean
+        default: false
+
+      # ==================== 产物与发布 ====================
+      artifact_upload_mode:
+        description: "产物上传模式 (上传全部 = AnyKernel3.zip + 三种压缩格式的 boot.img)"
+        type: choice
+        default: "上传全部"
+        options:
+          - "上传全部"
+          - "仅上传 AnyKernel3.zip"
+      version:
+        description: "自定义版本名 (可选)"
+        type: string
+        default: ""
+        required: false
+      build_time:
+        description: "自定义构建时间 (可选, 留空=当前UTC)"
+        type: string
+        default: ""
+        required: false
+
+jobs:
+  # 解析基线选项 -> 子版本号 / 安全补丁级别 / revision
+  resolve-baseline:
+    name: 解析内核基线
+    runs-on: ubuntu-latest
+    outputs:
+      sub_level: ${{ steps.parse.outputs.sub_level }}
+      os_patch_level: ${{ steps.parse.outputs.os_patch_level }}
+      revision: ${{ steps.parse.outputs.revision }}
+    steps:
+      - name: 解析
+        id: parse
+        run: |
+          BASELINE="${{ inputs.baseline }}"
+          SUB="$(echo "$BASELINE" | cut -d'|' -f1)"
+          PATCH="$(echo "$BASELINE" | cut -d'|' -f2)"
+          REV="$(echo "$BASELINE" | cut -d'|' -f3)"
+          if [ -z "$SUB" ] || [ -z "$PATCH" ] || [ -z "$REV" ]; then
+            echo "错误: 基线格式不正确: $BASELINE" >&2
+            exit 1
+          fi
+          echo "sub_level=$SUB" >> "$GITHUB_OUTPUT"
+          echo "os_patch_level=$PATCH" >> "$GITHUB_OUTPUT"
+          echo "revision=$REV" >> "$GITHUB_OUTPUT"
+          echo "======================================"
+          echo "本次构建基线: android12-5.10.$SUB ($PATCH) $REV"
+          echo "======================================"
+
+  # 调用仓库自带的通用构建流程 (dev 分支 build.yml)
+  build-kernel:
+    name: 构建 5.10.${{ needs.resolve-baseline.outputs.sub_level }} ReSukiSU+SUSFS
+    needs: resolve-baseline
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      android_version: "android12"
+      kernel_version: "5.10"
+      sub_level: ${{ needs.resolve-baseline.outputs.sub_level }}
+      os_patch_level: ${{ needs.resolve-baseline.outputs.os_patch_level }}
+      revision: ${{ needs.resolve-baseline.outputs.revision }}
+      ksu_variant: ${{ inputs.kernelsu_variant }}
+      version: ${{ inputs.version || '' }}
+      build_time: ${{ inputs.build_time || '' }}
+      use_zram: ${{ inputs.use_zram }}
+      use_bbg: ${{ inputs.use_bbg }}
+      use_kpm: ${{ inputs.use_kpm }}
+      use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
+      supp_op: false
+      enable_susfs: ${{ !inputs.cancel_susfs }}
+      droidspaces: ${{ inputs.droidspaces || 'off' }}
+      droidspaces_ntsync: ${{ inputs.droidspaces_ntsync || false }}
+      artifact_upload_mode: ${{ inputs.artifact_upload_mode }}
+
+  # 顺带下载对应内核的 KSU 管理器 APK + SUSFS 模块
+  get-ksu-manager:
+    name: 获取 KSU 管理器
+    uses: ./.github/workflows/get-manager.yml
+    secrets: inherit
+    with:
+      kernelsu_variant: ${{ inputs.kernelsu_variant }}
